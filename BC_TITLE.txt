@@ -1,0 +1,1 @@
+ClickHouse: SQL SECURITY DEFINER refreshable materialized view over Distributed bypasses authentication on interserver-secret clusters

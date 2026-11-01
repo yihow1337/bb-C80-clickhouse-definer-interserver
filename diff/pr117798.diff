@@ -1,0 +1,774 @@
+diff --git a/src/Storages/Distributed/DistributedAsyncInsertBatch.cpp b/src/Storages/Distributed/DistributedAsyncInsertBatch.cpp
+index 95b8be2ecfb27..26766c2316983 100644
+--- a/src/Storages/Distributed/DistributedAsyncInsertBatch.cpp
++++ b/src/Storages/Distributed/DistributedAsyncInsertBatch.cpp
+@@ -21,6 +21,7 @@
+ 
+ #include <fmt/ranges.h>
+ #include <filesystem>
++#include <optional>
+ #include <ranges>
+ 
+ namespace CurrentMetrics
+@@ -217,6 +218,11 @@ bool DistributedAsyncInsertBatch::recoverBatch()
+     }
+     files.erase(files.begin(), first_existing_file);
+ 
++    /// The batch is sent with the `ClientInfo` of its first file. Older servers could put files of different
++    /// users (or originating hosts) into one batch, so a restored batch of mixed identities must not be resent
++    /// as a whole: it is dropped, and its files are batched again by identity like any other pending files.
++    std::optional<std::pair<String, String>> batch_identity;
++
+     /// A missing file inside the surviving suffix cannot be recovered safely.
+     for (const auto & file : files)
+     {
+@@ -235,6 +241,18 @@ bool DistributedAsyncInsertBatch::recoverBatch()
+                 total_rows += header.rows;
+                 total_bytes += header.bytes;
+             }
++
++            auto identity = getRemoteAuthenticationIdentity(header.client_info);
++            if (!batch_identity)
++            {
++                batch_identity = std::move(identity);
++            }
++            else if (identity != *batch_identity)
++            {
++                LOG_WARNING(parent.log, "File {} has a different user or originating host than the first file of the batch, "
++                    "the files of the batch will be sent in new batches", file);
++                return false;
++            }
+         }
+         catch (Exception & e)
+         {
+diff --git a/src/Storages/Distributed/DistributedAsyncInsertDirectoryQueue.cpp b/src/Storages/Distributed/DistributedAsyncInsertDirectoryQueue.cpp
+index d643044874123..a7ccd52ecccc6 100644
+--- a/src/Storages/Distributed/DistributedAsyncInsertDirectoryQueue.cpp
++++ b/src/Storages/Distributed/DistributedAsyncInsertDirectoryQueue.cpp
+@@ -526,8 +526,11 @@ struct DistributedAsyncInsertDirectoryQueue::BatchHeader
+ 
+     bool operator==(const BatchHeader & other) const
+     {
++        /// The whole batch is sent with the `ClientInfo` of its first file, so files that the shard would
++        /// authenticate differently must never be merged into one batch.
+         return std::tie(settings, query, client_info.query_kind, client_info.client_agent, client_info.is_internal) ==
+                std::tie(other.settings, other.query, other.client_info.query_kind, other.client_info.client_agent, other.client_info.is_internal) &&
++               getRemoteAuthenticationIdentity(client_info) == getRemoteAuthenticationIdentity(other.client_info) &&
+                blocksHaveEqualStructure(header, other.header);
+     }
+ 
+@@ -537,6 +540,9 @@ struct DistributedAsyncInsertDirectoryQueue::BatchHeader
+         {
+             SipHash hash_state;
+             hash_state.update(batch_header.query.data(), batch_header.query.size());
++            const auto [initial_user, initial_host] = getRemoteAuthenticationIdentity(batch_header.client_info);
++            hash_state.update(initial_user.data(), initial_user.size());
++            hash_state.update(initial_host.data(), initial_host.size());
+             hash_state.update(batch_header.client_info.client_agent.data(), batch_header.client_info.client_agent.size());
+             hash_state.update(batch_header.client_info.is_internal);
+             batch_header.header.updateHash(hash_state);
+diff --git a/src/Storages/Distributed/DistributedAsyncInsertHelpers.cpp b/src/Storages/Distributed/DistributedAsyncInsertHelpers.cpp
+index 8cbb8461f5ea7..7890ecb8f89e0 100644
+--- a/src/Storages/Distributed/DistributedAsyncInsertHelpers.cpp
++++ b/src/Storages/Distributed/DistributedAsyncInsertHelpers.cpp
+@@ -68,6 +68,14 @@ static void writeAndConvert(RemoteInserter & remote, const DistributedAsyncInser
+     }
+ }
+ 
++std::pair<String, String> getRemoteAuthenticationIdentity(const ClientInfo & client_info)
++{
++    String initial_host;
++    if (client_info.initial_address)
++        initial_host = client_info.initial_address->host().toString();
++    return {client_info.initial_user, initial_host};
++}
++
+ void writeRemoteConvert(
+     const DistributedAsyncInsertHeader & distributed_header,
+     RemoteInserter & remote,
+diff --git a/src/Storages/Distributed/DistributedAsyncInsertHelpers.h b/src/Storages/Distributed/DistributedAsyncInsertHelpers.h
+index 202d9ff6fff8b..3cc335c169f98 100644
+--- a/src/Storages/Distributed/DistributedAsyncInsertHelpers.h
++++ b/src/Storages/Distributed/DistributedAsyncInsertHelpers.h
+@@ -1,12 +1,16 @@
+ #pragma once
+ 
+ #include <Common/Logger.h>
++#include <base/types.h>
++
++#include <utility>
+ 
+ 
+ namespace DB
+ {
+ 
+ struct DistributedAsyncInsertHeader;
++class ClientInfo;
+ class ReadBufferFromFile;
+ class RemoteInserter;
+ 
+@@ -23,6 +27,11 @@ class RemoteInserter;
+ ///     and mark batch as broken.
+ bool isDistributedSendBroken(int code, bool remote_error);
+ 
++/// The identity the shard authenticates a queued insert as (with the interserver `<secret>`): `initial_user`
++/// and the host of `initial_address`, which is checked against the allowed hosts of that user.
++/// A batch is sent with the `ClientInfo` of its first file, so all files of a batch must have the same identity.
++std::pair<String, String> getRemoteAuthenticationIdentity(const ClientInfo & client_info);
++
+ void writeRemoteConvert(
+     const DistributedAsyncInsertHeader & distributed_header,
+     RemoteInserter & remote,
+diff --git a/src/Storages/Distributed/DistributedSink.cpp b/src/Storages/Distributed/DistributedSink.cpp
+index a06b8636094f1..4bb16c4f6e3cd 100644
+--- a/src/Storages/Distributed/DistributedSink.cpp
++++ b/src/Storages/Distributed/DistributedSink.cpp
+@@ -981,17 +981,21 @@ void DistributedSink::writeToShard(const Cluster::ShardInfo & shard_info, const
+             /// `client_agent` is intentionally excluded from the embedded `ClientInfo` here and written
+             /// as a trailing header field below, so that older binaries draining these queue files read
+             /// the embedded `ClientInfo` in the old, append-compatible layout.
+-            if (OpenTelemetry::CurrentContext().isTraceEnabled())
+             {
+-                // if the distributed tracing is enabled, use the trace context in current thread as parent of next span
+                 auto client_info = context->getClientInfo();
+-                client_info.client_trace_context = OpenTelemetry::CurrentContext();
++                // if the distributed tracing is enabled, use the trace context in current thread as parent of next span
++                if (OpenTelemetry::CurrentContext().isTraceEnabled())
++                    client_info.client_trace_context = OpenTelemetry::CurrentContext();
++                /// Background contexts (e.g. the ones of `Kafka` / `RabbitMQ` streaming into views) have
++                /// `query_kind = NO_QUERY`, for which `ClientInfo::write` stores nothing but the kind. The
++                /// replayed insert would then reach the shard with an empty `initial_user`, which a shard
++                /// accepting the interserver `<secret>` executes with full access, losing the identity
++                /// (e.g. the definer of a `SQL SECURITY DEFINER` view) that the query is bound to.
++                /// `RemoteInserter` sends the insert as a secondary query anyway, so persist it as such.
++                if (client_info.query_kind == ClientInfo::QueryKind::NO_QUERY)
++                    client_info.query_kind = ClientInfo::QueryKind::SECONDARY_QUERY;
+                 client_info.write(header_buf, DBMS_TCP_PROTOCOL_VERSION, /*with_trailing_fields=*/ false);
+             }
+-            else
+-            {
+-                context->getClientInfo().write(header_buf, DBMS_TCP_PROTOCOL_VERSION, /*with_trailing_fields=*/ false);
+-            }
+ 
+             writeVarUInt(block.rows(), header_buf);
+             writeVarUInt(block.bytes(), header_buf);
+diff --git a/src/Storages/StorageInMemoryMetadata.cpp b/src/Storages/StorageInMemoryMetadata.cpp
+index b013ca183ca70..9839be5cb45c6 100644
+--- a/src/Storages/StorageInMemoryMetadata.cpp
++++ b/src/Storages/StorageInMemoryMetadata.cpp
+@@ -238,6 +238,43 @@ ContextMutablePtr StorageInMemoryMetadata::getSQLSecurityOverriddenContext(Conte
+     {
+         new_context->setUser(getDefinerID(context));
+ 
++        /// `Context::setUser` only sets the access-control identity (`user_id`); it does not touch the
++        /// user names in `ClientInfo`. That is harmless when there is an invoker whose names were copied
++        /// above, but a scheduled refresh of a refreshable materialized view builds its context from the
++        /// global context, where `current_user`, `initial_user` and `authenticated_user` are empty.
++        /// `RemoteQueryExecutor` sends the names as-is, and a shard that accepts the interserver
++        /// `<secret>` treats an empty `initial_user` as "interserver mode": it skips authentication
++        /// (see `TCPHandler::receiveQuery`) and executes the query with full access
++        /// (see `Context::getAccess`, `full_access = !user_id`). Stamp the definer into the empty fields
++        /// so the remote leg of the query is bounded by the same identity as the local one. Non-empty
++        /// fields are left alone so `currentUser` inside an ordinary `DEFINER` view still returns the
++        /// invoker. `AsynchronousInsertQueue` and `InterpreterExecuteAsQuery` do the same.
++        {
++            const auto & new_client_info = new_context->getClientInfo();
++            const bool current_user_empty = new_client_info.current_user.empty();
++            const bool initial_user_empty = new_client_info.initial_user.empty();
++            const bool authenticated_user_empty = new_client_info.authenticated_user.empty();
++
++            if (current_user_empty || initial_user_empty || authenticated_user_empty)
++            {
++                const auto definer_name = new_context->getUserName();
++                if (current_user_empty)
++                    new_context->setCurrentUserName(definer_name);
++                if (initial_user_empty)
++                {
++                    new_context->setInitialUserName(definer_name);
++                    /// The shard authenticates the definer by `initial_user` and checks `initial_address`
++                    /// against the allowed hosts of that user. Without an invoker, the address is the
++                    /// unspecified `0.0.0.0`, which only matches users with `HOST ANY`. The query is
++                    /// produced by this server itself, so present it as coming from the local host.
++                    if (!new_client_info.initial_address || new_client_info.initial_address->host().isWildcard())
++                        new_context->setInitialAddress(Poco::Net::SocketAddress(Poco::Net::IPAddress("127.0.0.1"), 0));
++                }
++                if (authenticated_user_empty)
++                    new_context->setAuthenticatedUserName(definer_name);
++            }
++        }
++
+         new_context->clampToSettingsConstraints(changed_settings, SettingSource::QUERY);
+         new_context->applySettingsChanges(changed_settings);
+         new_context->setSetting("allow_ddl", 1);
+diff --git a/src/Storages/StorageMaterializedView.cpp b/src/Storages/StorageMaterializedView.cpp
+index 2842d821e2a02..6a26847fbfdb6 100644
+--- a/src/Storages/StorageMaterializedView.cpp
++++ b/src/Storages/StorageMaterializedView.cpp
+@@ -741,11 +741,19 @@ ContextMutablePtr StorageMaterializedView::createRefreshContext(const String & l
+ {
+     ContextPtr table_context = getContext();
+     ClientInfo client_info = table_context->getClientInfo();
+-    client_info.interface = ClientInfo::Interface::BACKGROUND;
+-    client_info.client_name = "refreshable materialized view";
+     auto view_metadata = getInMemoryMetadataPtr(getContext(), false);
+     auto refresh_context = view_metadata->getSQLSecurityOverriddenContext(table_context, &client_info);
+-    refresh_context->setClientInfo(client_info);
++    /// For `SQL SECURITY DEFINER`, `getSQLSecurityOverriddenContext` fills the empty user names in
++    /// the context's `ClientInfo` with the definer. Do not assign the local `client_info` copy to
++    /// the context: `setClientInfo` replaces the whole struct and would wipe that identity out.
++    /// Re-read it instead, so that a view without SQL security (which gets a plain copy) also gets
++    /// these fields.
++    {
++        ClientInfo refresh_client_info = refresh_context->getClientInfo();
++        refresh_client_info.interface = ClientInfo::Interface::BACKGROUND;
++        refresh_client_info.client_name = "refreshable materialized view";
++        refresh_context->setClientInfo(refresh_client_info);
++    }
+     refresh_context->setSetting("database_replicated_allow_replicated_engine_arguments", 3);
+     refresh_context->setSetting("log_comment", log_comment);
+     refresh_context->setQueryKind(ClientInfo::QueryKind::INITIAL_QUERY);
+diff --git a/tests/integration/test_refreshable_mv_definer_interserver_secret/__init__.py b/tests/integration/test_refreshable_mv_definer_interserver_secret/__init__.py
+new file mode 100644
+index 0000000000000..e69de29bb2d1d
+diff --git a/tests/integration/test_refreshable_mv_definer_interserver_secret/configs/remote_servers.xml b/tests/integration/test_refreshable_mv_definer_interserver_secret/configs/remote_servers.xml
+new file mode 100644
+index 0000000000000..362c39c90ed8c
+--- /dev/null
++++ b/tests/integration/test_refreshable_mv_definer_interserver_secret/configs/remote_servers.xml
+@@ -0,0 +1,11 @@
++<clickhouse>
++    <remote_servers>
++        <secure>
++            <secret>foo</secret>
++            <node>
++                <host>node2</host>
++                <port>9000</port>
++            </node>
++        </secure>
++    </remote_servers>
++</clickhouse>
+diff --git a/tests/integration/test_refreshable_mv_definer_interserver_secret/test.py b/tests/integration/test_refreshable_mv_definer_interserver_secret/test.py
+new file mode 100644
+index 0000000000000..f94ef84ab15b3
+--- /dev/null
++++ b/tests/integration/test_refreshable_mv_definer_interserver_secret/test.py
+@@ -0,0 +1,99 @@
++import pytest
++
++from helpers.cluster import ClickHouseCluster, QueryRuntimeException
++
++cluster = ClickHouseCluster(__file__)
++
++node1 = cluster.add_instance(
++    "node1",
++    main_configs=["configs/remote_servers.xml"],
++    with_zookeeper=True,
++)
++node2 = cluster.add_instance(
++    "node2",
++    main_configs=["configs/remote_servers.xml"],
++    with_zookeeper=True,
++)
++
++TENANT = {"user": "tenant", "password": "tpass"}
++
++
++@pytest.fixture(scope="module")
++def started_cluster():
++    try:
++        cluster.start()
++        yield cluster
++    finally:
++        cluster.shutdown()
++
++
++def test_scheduled_refresh_of_definer_view_carries_definer_to_remote_shard(
++    started_cluster,
++):
++    # Protected data lives only on node2. The tenant exists on both nodes but has no grant on it.
++    node2.query(
++        """
++        CREATE DATABASE lab;
++        CREATE USER tenant IDENTIFIED WITH plaintext_password BY 'tpass';
++        CREATE TABLE lab.secrets (id UInt64, payload String) ENGINE = MergeTree ORDER BY id;
++        INSERT INTO lab.secrets VALUES (1, 'a'), (2, 'b'), (3, 'c');
++        """
++    )
++    node1.query(
++        """
++        CREATE DATABASE tenant_db;
++        CREATE USER tenant IDENTIFIED WITH plaintext_password BY 'tpass';
++        GRANT CREATE TABLE, SELECT, INSERT ON tenant_db.* TO tenant;
++        GRANT TABLE ENGINE ON Distributed TO tenant;
++        """
++    )
++
++    node1.query(
++        """
++        CREATE TABLE tenant_db.dist (id UInt64, payload String)
++        ENGINE = Distributed('secure', 'lab', 'secrets', rand());
++        CREATE TABLE tenant_db.target
++        (id UInt64, payload String, current_user String, authenticated_user String)
++        ENGINE = MergeTree ORDER BY id;
++        """,
++        **TENANT,
++    )
++
++    # A direct read through the Distributed table is denied on the remote shard.
++    assert "ACCESS_DENIED" in node1.query_and_get_error(
++        "SELECT * FROM tenant_db.dist", **TENANT
++    )
++
++    # The shard also checks the allowed hosts of the definer against `initial_address`. A scheduled
++    # refresh has no client, so it must present itself as coming from the local host of the
++    # initiator rather than from the unspecified address, which only `HOST ANY` users accept.
++    node2.query("ALTER USER tenant HOST LOCAL")
++
++    # The refresh runs under the definer's identity and must be denied on the remote shard too.
++    # Before the fix, the refresh query was sent with an empty `initial_user`, which the remote
++    # shard treated as interserver mode and executed without any access checks.
++    node1.query(
++        """
++        CREATE MATERIALIZED VIEW tenant_db.rmv REFRESH EVERY 1 YEAR APPEND TO tenant_db.target
++        DEFINER = CURRENT_USER SQL SECURITY DEFINER
++        AS SELECT id, payload, currentUser() AS current_user, authenticatedUser() AS authenticated_user
++        FROM tenant_db.dist;
++        """,
++        **TENANT,
++    )
++
++    with pytest.raises(QueryRuntimeException, match="ACCESS_DENIED"):
++        node1.query("SYSTEM WAIT VIEW tenant_db.rmv")
++    assert node1.query("SELECT count() FROM tenant_db.target") == "0\n"
++    assert "ACCESS_DENIED" in node1.query(
++        "SELECT exception FROM system.view_refreshes WHERE database = 'tenant_db' AND view = 'rmv'"
++    )
++
++    # Once the definer is granted access on the remote shard, the refresh succeeds and the remote
++    # shard sees the definer as the current and authenticated user.
++    node2.query("GRANT SELECT ON lab.secrets TO tenant")
++    node1.query("SYSTEM REFRESH VIEW tenant_db.rmv")
++    node1.query("SYSTEM WAIT VIEW tenant_db.rmv")
++    assert node1.query("SELECT * FROM tenant_db.target ORDER BY id", **TENANT) == (
++        "1\ta\ttenant\ttenant\n2\tb\ttenant\ttenant\n3\tc\ttenant\ttenant\n"
++    )
+diff --git a/tests/integration/test_streaming_engines_definer_interserver_secret/__init__.py b/tests/integration/test_streaming_engines_definer_interserver_secret/__init__.py
+new file mode 100644
+index 0000000000000..e69de29bb2d1d
+diff --git a/tests/integration/test_streaming_engines_definer_interserver_secret/configs/rabbitmq.xml b/tests/integration/test_streaming_engines_definer_interserver_secret/configs/rabbitmq.xml
+new file mode 100644
+index 0000000000000..0b5411455b46b
+--- /dev/null
++++ b/tests/integration/test_streaming_engines_definer_interserver_secret/configs/rabbitmq.xml
+@@ -0,0 +1,6 @@
++<clickhouse>
++    <rabbitmq>
++        <username>root</username>
++        <password>clickhouse</password>
++    </rabbitmq>
++</clickhouse>
+diff --git a/tests/integration/test_streaming_engines_definer_interserver_secret/configs/remote_servers.xml b/tests/integration/test_streaming_engines_definer_interserver_secret/configs/remote_servers.xml
+new file mode 100644
+index 0000000000000..af0b7ad21cab3
+--- /dev/null
++++ b/tests/integration/test_streaming_engines_definer_interserver_secret/configs/remote_servers.xml
+@@ -0,0 +1,14 @@
++<clickhouse>
++    <remote_servers>
++        <!-- node1 is the initiator and is deliberately not part of the cluster: the only way
++             for a table on node1 to reach `default.secret_data` is over the network, through
++             the interserver secret. -->
++        <secure>
++            <secret>foo</secret>
++            <node>
++                <host>node2</host>
++                <port>9000</port>
++            </node>
++        </secure>
++    </remote_servers>
++</clickhouse>
+diff --git a/tests/integration/test_streaming_engines_definer_interserver_secret/configs/users.xml b/tests/integration/test_streaming_engines_definer_interserver_secret/configs/users.xml
+new file mode 100644
+index 0000000000000..ae00b3b543f9f
+--- /dev/null
++++ b/tests/integration/test_streaming_engines_definer_interserver_secret/configs/users.xml
+@@ -0,0 +1,23 @@
++<clickhouse>
++    <profiles>
++        <default>
++        </default>
++    </profiles>
++
++    <users>
++        <default>
++            <password></password>
++            <networks>
++                <ip>::/0</ip>
++            </networks>
++            <profile>default</profile>
++            <quota>default</quota>
++            <access_management>1</access_management>
++        </default>
++    </users>
++
++    <quotas>
++        <default>
++        </default>
++    </quotas>
++</clickhouse>
+diff --git a/tests/integration/test_streaming_engines_definer_interserver_secret/test.py b/tests/integration/test_streaming_engines_definer_interserver_secret/test.py
+new file mode 100644
+index 0000000000000..6a0ed02eadf3c
+--- /dev/null
++++ b/tests/integration/test_streaming_engines_definer_interserver_secret/test.py
+@@ -0,0 +1,296 @@
++# pylint: disable=unused-argument
++# pylint: disable=redefined-outer-name
++# pylint: disable=line-too-long
++
++"""
++Pushes from streaming engines into a `Distributed` table must reach the shard under the definer.
++
++`Kafka`, `RabbitMQ` and the other streaming engines never write anywhere themselves: a consumed
++batch is pushed only into the dependent materialized views, from a copy of the global context that
++has no user. A view with `SQL SECURITY DEFINER` switches that push to the definer. When the view's
++target is a `Distributed` table over a cluster with an interserver `<secret>`, the definer's name
++must travel with the query: before the fix `Context::setUser` left the `ClientInfo` user names
++empty, the shard received an empty `initial_user`, treated the query as interserver mode and
++executed it with full access. A tenant that could create tables only in its own database could
++chain `Kafka -> MATERIALIZED VIEW -> Distributed('secure', default, secret_data)` and write into
++a table on the shard it had no `INSERT` grant on.
++
++The `secure` cluster consists of `node2` only, so a table on `node1` can reach `default.secret_data`
++solely over the interserver connection. Every pipeline is built twice with the same statements: by
++`tenant`, who has no grants on `node2` and whose rows must be rejected there, and by `writer`, who
++has `INSERT` on the target and whose rows must arrive. In both cases the shard must see the
++definer's name in `system.query_log`.
++
++The push is also checked with `distributed_foreground_insert = 0`, where the rows go through the
++background directory queue of the `Distributed` table: the persisted insert must keep the definer's
++name, although the streaming context has `query_kind = NO_QUERY`.
++"""
++
++import json
++import time
++
++import pika
++import pytest
++
++import helpers.kafka.common as k
++from helpers.cluster import ClickHouseCluster
++
++cluster = ClickHouseCluster(__file__)
++
++node1 = cluster.add_instance(
++    "node1",
++    main_configs=["configs/remote_servers.xml", "configs/rabbitmq.xml"],
++    user_configs=["configs/users.xml"],
++    with_kafka=True,
++    with_rabbitmq=True,
++)
++node2 = cluster.add_instance(
++    "node2",
++    main_configs=["configs/remote_servers.xml"],
++    user_configs=["configs/users.xml"],
++)
++
++WRITER = "writer"
++TENANT = "tenant"
++CREDENTIALS = {
++    WRITER: {"user": WRITER, "password": "wpass"},
++    TENANT: {"user": TENANT, "password": "tpass"},
++}
++ROWS_PER_PIPELINE = 2
++
++# How long a streaming engine gets to consume the messages and push them to the shard. Consumer
++# group setup in Kafka alone can take several seconds.
++DELIVERY_WAIT_SECONDS = 60
++
++users = pytest.mark.parametrize("user", [WRITER, TENANT])
++
++
++def database(user):
++    return f"{user}_db"
++
++
++def query_as(user, sql):
++    return node1.query(sql, **CREDENTIALS[user])
++
++
++def remote_rows():
++    return int(node2.query("SELECT count() FROM default.secret_data"))
++
++
++def shard_inserts(user, condition):
++    """Number of `INSERT` queries into the protected table that the shard executed under `user`."""
++    node2.query("SYSTEM FLUSH LOGS")
++    return int(
++        node2.query(
++            f"""
++            SELECT count() FROM system.query_log
++            WHERE user = '{user}' AND query LIKE 'INSERT INTO default.secret_data%' AND {condition}
++            """
++        )
++    )
++
++
++def shard_finished_inserts(user):
++    return shard_inserts(user, "type = 'QueryFinish'")
++
++
++def shard_denied_inserts(user):
++    # The access check happens before the pipeline starts, so the shard logs the denial as
++    # `ExceptionBeforeStart`.
++    return shard_inserts(
++        user,
++        "type IN ('ExceptionBeforeStart', 'ExceptionWhileProcessing') AND exception_code = 497",
++    )
++
++
++def wait_until(condition, timeout=DELIVERY_WAIT_SECONDS):
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if condition():
++            return True
++        time.sleep(1)
++    return False
++
++
++@pytest.fixture(scope="module", autouse=True)
++def started_cluster():
++    try:
++        cluster.start()
++
++        # The protected table lives on the shard only. Both users exist on both nodes, but on
++        # the shard only `writer` may insert into it.
++        node2.query(
++            """
++            CREATE TABLE default.secret_data (key Int) ENGINE = MergeTree ORDER BY key;
++            CREATE USER writer IDENTIFIED WITH plaintext_password BY 'wpass';
++            CREATE USER tenant IDENTIFIED WITH plaintext_password BY 'tpass';
++            GRANT INSERT ON default.secret_data TO writer;
++            """
++        )
++        for user in (WRITER, TENANT):
++            db = database(user)
++            # Send to the shard synchronously by default, so that a push either delivers the rows
++            # or fails right away, without a background directory queue in between.
++            node1.query(
++                f"""
++                CREATE USER {user} IDENTIFIED WITH plaintext_password BY '{CREDENTIALS[user]["password"]}'
++                    SETTINGS distributed_foreground_insert = 1;
++                CREATE DATABASE {db};
++                GRANT ALL ON {db}.* TO {user};
++                GRANT TABLE ENGINE ON Distributed, TABLE ENGINE ON Kafka, TABLE ENGINE ON RabbitMQ TO {user};
++                """
++            )
++            query_as(
++                user,
++                f"CREATE TABLE {db}.dist (key Int) ENGINE = Distributed(secure, default, secret_data)",
++            )
++
++        yield cluster
++    finally:
++        cluster.shutdown()
++
++
++@pytest.fixture(autouse=True)
++def clean_remote_table():
++    node2.query("TRUNCATE TABLE default.secret_data")
++    yield
++
++
++def drop_pipeline(user, source):
++    """Stop the streaming table, so that a rejected push is not retried into the next test."""
++    db = database(user)
++    query_as(user, f"DROP TABLE {db}.{source}_to_dist")
++    query_as(user, f"DROP TABLE {db}.{source} SYNC")
++
++
++def create_definer_view(user, source, target="dist"):
++    """A view owned by `user` that pushes the source rows into the user's `Distributed` table."""
++    db = database(user)
++    query_as(
++        user,
++        f"""
++        CREATE MATERIALIZED VIEW {db}.{source}_to_dist TO {db}.{target}
++        DEFINER = CURRENT_USER SQL SECURITY DEFINER
++        AS SELECT key FROM {db}.{source}
++        """,
++    )
++
++
++def check_delivery(user, finished_before, denied_before):
++    """The shard must have executed the push under the user's name, with the outcome the user's
++    grants dictate: the rows arrive for `writer` and are rejected for `tenant`."""
++    if user == WRITER:
++        assert wait_until(lambda: remote_rows() == ROWS_PER_PIPELINE)
++        assert shard_finished_inserts(WRITER) > finished_before
++    else:
++        assert wait_until(
++            lambda: shard_denied_inserts(TENANT) > denied_before or remote_rows() > 0
++        )
++        assert remote_rows() == 0
++        assert shard_denied_inserts(TENANT) > denied_before
++
++
++def check_direct_insert(user):
++    """The control case: a direct `INSERT` carries the user's name to the shard, where it is checked.
++
++    It passes without the fix as well, so it is not a separate test: bugfix validation requires every
++    new test to fail on the unfixed binary. It runs before a streaming pipeline instead."""
++    db = database(user)
++    if user == WRITER:
++        query_as(WRITER, f"INSERT INTO {db}.dist VALUES (1)")
++        assert remote_rows() == 1
++    else:
++        error = node1.query_and_get_error(
++            f"INSERT INTO {db}.dist VALUES (1)", **CREDENTIALS[TENANT]
++        )
++        assert "ACCESS_DENIED" in error
++        assert remote_rows() == 0
++    node2.query("TRUNCATE TABLE default.secret_data")
++
++
++@users
++@pytest.mark.parametrize("foreground", [1, 0])
++def test_kafka(user, foreground):
++    db = database(user)
++    topic = f"definer_interserver_{user}_{foreground}"
++    k.kafka_create_topic(k.get_admin_client(cluster), topic)
++
++    query_as(
++        user,
++        f"""
++        CREATE TABLE {db}.kafka (key Int) ENGINE = Kafka
++        SETTINGS kafka_broker_list = 'kafka1:19092',
++                 kafka_topic_list = '{topic}',
++                 kafka_group_name = '{topic}',
++                 kafka_format = 'JSONEachRow',
++                 kafka_flush_interval_ms = 1000
++        """,
++    )
++    # A separate `Distributed` table per mode, so that a rejected file left in the background queue
++    # is dropped together with the table and is not retried into the next test.
++    target = f"dist_{foreground}"
++    query_as(
++        user,
++        f"CREATE TABLE {db}.{target} (key Int) ENGINE = Distributed(secure, default, secret_data)",
++    )
++    # The definer's settings apply to the push. It is not set in the server's profile, because the
++    # settings of the context the push starts from would override the definer's ones.
++    node1.query(f"ALTER USER {user} SETTINGS distributed_foreground_insert = {foreground}")
++    create_definer_view(user, "kafka", target)
++
++    try:
++        finished_before = shard_finished_inserts(user)
++        denied_before = shard_denied_inserts(user)
++        k.kafka_produce(
++            cluster, topic, [json.dumps({"key": i}) for i in range(ROWS_PER_PIPELINE)]
++        )
++        check_delivery(user, finished_before, denied_before)
++    finally:
++        drop_pipeline(user, "kafka")
++        query_as(user, f"DROP TABLE {db}.{target} SYNC")
++        node1.query(f"ALTER USER {user} SETTINGS distributed_foreground_insert = 1")
++
++
++@users
++def test_rabbitmq(user):
++    check_direct_insert(user)
++    db = database(user)
++    exchange = f"definer_interserver_{user}"
++
++    query_as(
++        user,
++        f"""
++        CREATE TABLE {db}.rabbitmq (key Int) ENGINE = RabbitMQ
++        SETTINGS rabbitmq_host_port = 'rabbitmq1:5672',
++                 rabbitmq_exchange_name = '{exchange}',
++                 rabbitmq_format = 'JSONEachRow',
++                 rabbitmq_flush_interval_ms = 1000,
++                 rabbitmq_max_block_size = 100
++        """,
++    )
++    create_definer_view(user, "rabbitmq")
++
++    # The exchange and the queue are declared by the table in the background; messages
++    # published before that are dropped by RabbitMQ.
++    node1.wait_for_log_line(f"StorageRabbitMQ .{db}.rabbitmq.: RabbitMQ setup completed")
++    node1.wait_for_log_line(f"StorageRabbitMQ .{db}.rabbitmq.: Queue .* is declared")
++
++    try:
++        finished_before = shard_finished_inserts(user)
++        denied_before = shard_denied_inserts(user)
++
++        credentials = pika.PlainCredentials("root", "clickhouse")
++        parameters = pika.ConnectionParameters(
++            cluster.rabbitmq_ip, cluster.rabbitmq_port, "/", credentials
++        )
++        connection = pika.BlockingConnection(parameters)
++        channel = connection.channel()
++        for i in range(ROWS_PER_PIPELINE):
++            channel.basic_publish(
++                exchange=exchange, routing_key="", body=json.dumps({"key": i})
++            )
++        connection.close()
++
++        check_delivery(user, finished_before, denied_before)
++    finally:
++        drop_pipeline(user, "rabbitmq")
+diff --git a/tests/queries/0_stateless/05445_distributed_async_insert_batch_per_user.reference b/tests/queries/0_stateless/05445_distributed_async_insert_batch_per_user.reference
+new file mode 100644
+index 0000000000000..aa20b4a608862
+--- /dev/null
++++ b/tests/queries/0_stateless/05445_distributed_async_insert_batch_per_user.reference
+@@ -0,0 +1 @@
++ACCESS_DENIED
+diff --git a/tests/queries/0_stateless/05445_distributed_async_insert_batch_per_user.sh b/tests/queries/0_stateless/05445_distributed_async_insert_batch_per_user.sh
+new file mode 100755
+index 0000000000000..71282f1c84378
+--- /dev/null
++++ b/tests/queries/0_stateless/05445_distributed_async_insert_batch_per_user.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++# Tags: distributed, no-fasttest
++# Tag no-fasttest: the interserver `<secret>` requires SSL, which the fast test build does not have.
++
++# Queued `Distributed` inserts of different users must not be sent in one batch: the batch is sent with
++# the `ClientInfo` of its first file, and over a cluster with an interserver `<secret>` the shard
++# authenticates the whole batch as that file's `initial_user`. Before the fix, rows of a user without
++# the remote `INSERT` grant were delivered under the identity of a user that had it.
++
++CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
++# shellcheck source=../shell_config.sh
++. "$CUR_DIR"/../shell_config.sh
++
++# Flushing the rejected file (also when the table is dropped) logs the error on the server.
++CLICKHOUSE_CLIENT=$(echo "$CLICKHOUSE_CLIENT" | sed "s/--send_logs_level=${CLICKHOUSE_CLIENT_SERVER_LOGS_LEVEL:-none}/--send_logs_level=none/g")
++
++WRITER="writer_${CLICKHOUSE_DATABASE}"
++TENANT="tenant_${CLICKHOUSE_DATABASE}"
++
++${CLICKHOUSE_CLIENT} -m -q "
++    DROP USER IF EXISTS ${WRITER}, ${TENANT};
++    CREATE TABLE target (key Int) ENGINE = MergeTree ORDER BY key;
++    CREATE TABLE dist (key Int) ENGINE = Distributed(test_cluster_interserver_secret, currentDatabase(), target, 0)
++        SETTINGS background_insert_batch = 1;
++    SYSTEM STOP DISTRIBUTED SENDS dist;
++    CREATE USER ${WRITER} IDENTIFIED WITH no_password;
++    CREATE USER ${TENANT} IDENTIFIED WITH no_password;
++    GRANT INSERT ON ${CLICKHOUSE_DATABASE}.dist TO ${WRITER}, ${TENANT};
++    GRANT INSERT ON ${CLICKHOUSE_DATABASE}.target TO ${WRITER};
++"
++
++${CLICKHOUSE_CLIENT} --user "${WRITER}" --distributed_foreground_insert 0 --prefer_localhost_replica 0 -q "INSERT INTO dist VALUES (1)"
++${CLICKHOUSE_CLIENT} --user "${TENANT}" --distributed_foreground_insert 0 --prefer_localhost_replica 0 -q "INSERT INTO dist VALUES (2)"
++
++${CLICKHOUSE_CLIENT} -q "SYSTEM FLUSH DISTRIBUTED dist" 2>&1 | grep -o -m1 "ACCESS_DENIED"
++${CLICKHOUSE_CLIENT} -q "SELECT key FROM target WHERE key = 2"
++
++${CLICKHOUSE_CLIENT} -m -q "
++    DROP TABLE dist;
++    DROP USER ${WRITER}, ${TENANT};
++"
